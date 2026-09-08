@@ -34,6 +34,23 @@ def sanitize(name: str) -> str:
     return name.strip().rstrip(".") or "untitled"
 
 
+def parse_rate_limit(s: str) -> float:
+    """Parse a rate like '500K', '2M', '1.5G', or a plain byte count, into bytes/sec."""
+    s = s.strip().upper()
+    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
+    if s and s[-1] in multipliers:
+        value, mult = s[:-1], multipliers[s[-1]]
+    else:
+        value, mult = s, 1
+    try:
+        rate = float(value) * mult
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid rate '{s}', expected e.g. 500K, 2M, 1.5G, or a byte count")
+    if rate <= 0:
+        raise argparse.ArgumentTypeError("rate limit must be greater than zero")
+    return rate
+
+
 class FloatplaneClient:
     def __init__(self, cookie: str | None = None, user_agent: str = DEFAULT_UA):
         self.session = requests.Session()
@@ -144,7 +161,7 @@ def resolve_url(variant: dict, base: str) -> str:
     return base.rstrip("/") + "/" + url.lstrip("/")
 
 
-def download_file(session: requests.Session, url: str, dest: Path) -> None:
+def download_file(session: requests.Session, url: str, dest: Path, rate_limit: float | None = None) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(dest.name + ".part")
 
@@ -152,6 +169,10 @@ def download_file(session: requests.Session, url: str, dest: Path) -> None:
     headers = {"Referer": "https://www.floatplane.com/"}
     if resume_pos:
         headers["Range"] = f"bytes={resume_pos}-"
+
+    # Keep chunks roughly ~0.5s worth of data at the configured rate, so the
+    # sleep-based throttle below is smooth rather than bursty at low rates.
+    chunk_size = CHUNK_SIZE if not rate_limit else max(16 * 1024, min(CHUNK_SIZE, int(rate_limit / 2)))
 
     with session.get(url, headers=headers, stream=True, timeout=60) as r:
         if resume_pos and r.status_code == 416:
@@ -164,12 +185,22 @@ def download_file(session: requests.Session, url: str, dest: Path) -> None:
         total = resume_pos + int(r.headers.get("Content-Length", 0))
         downloaded = resume_pos
         last_print = 0.0
+        throttle_start = time.monotonic()
+        throttled_bytes = 0
         with open(tmp, mode) as f:
-            for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+            for chunk in r.iter_content(chunk_size=chunk_size):
                 if not chunk:
                     continue
                 f.write(chunk)
                 downloaded += len(chunk)
+                throttled_bytes += len(chunk)
+
+                if rate_limit:
+                    expected_elapsed = throttled_bytes / rate_limit
+                    actual_elapsed = time.monotonic() - throttle_start
+                    if expected_elapsed > actual_elapsed:
+                        time.sleep(expected_elapsed - actual_elapsed)
+
                 now = time.time()
                 if total and now - last_print > 1:
                     pct = downloaded / total * 100
@@ -202,6 +233,13 @@ def parse_args():
     p.add_argument("--from-date", default=None, help="ISO 8601 date; only posts released on/after this date")
     p.add_argument("--to-date", default=None, help="ISO 8601 date; only posts released on/before this date")
     p.add_argument("--dry-run", action="store_true", help="List what would be downloaded without downloading")
+    p.add_argument(
+        "--limit-rate",
+        type=parse_rate_limit,
+        default=None,
+        help="Cap download bandwidth, e.g. 500K, 2M, 1.5G (bytes/sec). "
+        "Useful for a slow background run that shouldn't hog your connection.",
+    )
     return p.parse_args()
 
 
@@ -279,7 +317,7 @@ def main():
                 url = resolve_url(variant, base)
                 print(f"Downloading: {fname}  [{variant.get('label', '?')}]")
                 try:
-                    download_file(client.session, url, dest)
+                    download_file(client.session, url, dest, rate_limit=args.limit_rate)
                 except (requests.RequestException, OSError) as e:
                     print(f"  ERROR downloading {fname}: {e}", file=sys.stderr)
 

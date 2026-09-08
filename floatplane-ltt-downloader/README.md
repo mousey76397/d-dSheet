@@ -47,6 +47,9 @@ FLOATPLANE_SID="<cookie value>" python3 floatplane_dl.py
 # A specific quality, custom output folder
 FLOATPLANE_SID="..." python3 floatplane_dl.py --quality 1080p --output /media/LTT
 
+# Cap bandwidth at 2 MB/s so it can just run in the background for days
+FLOATPLANE_SID="..." python3 floatplane_dl.py --limit-rate 2M
+
 # Multiple LMG channels in one run
 FLOATPLANE_SID="..." python3 floatplane_dl.py --creator linustechtips,techlinked,techquickie
 
@@ -72,6 +75,10 @@ Run `python3 floatplane_dl.py --help` for all options.
   warning.
 - Requests are retried automatically if Floatplane responds with `429 Too
   Many Requests`, honouring its `Retry-After` header.
+- `--limit-rate` caps average download bandwidth (per file, not aggregate),
+  e.g. `--limit-rate 500K`, `--limit-rate 2M`, `--limit-rate 1.5G`. Handy
+  for a slow, unattended run that shouldn't compete with everything else
+  on your connection.
 
 ## Known limitations
 
