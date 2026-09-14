@@ -103,6 +103,16 @@ one.
   e.g. `--limit-rate 500K`, `--limit-rate 2M`, `--limit-rate 1.5G`. Handy
   for a slow, unattended run that shouldn't compete with everything else
   on your connection.
+- `--dry-run` prints the size of each video (from Floatplane's own metadata,
+  at whatever `--quality` would be picked) plus a per-creator and overall
+  total, so you can check free disk space before committing to a big
+  back-catalogue run. This is the total for *this run* — files already
+  present in `--output` are skipped and not counted, so re-running after a
+  partial download only estimates what's left. A file occasionally has no
+  size in Floatplane's metadata; those are called out separately rather
+  than silently under-counting the total. Because this needs Floatplane's
+  per-video delivery info to get a size, `--dry-run` makes the same number
+  of API calls as a real run — it just skips the actual video download.
 
 ## Known limitations
 

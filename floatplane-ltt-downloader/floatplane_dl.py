@@ -34,6 +34,15 @@ def sanitize(name: str) -> str:
     return name.strip().rstrip(".") or "untitled"
 
 
+def human_size(num_bytes: float) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 def parse_rate_limit(s: str) -> float:
     """Parse a rate like '500K', '2M', '1.5G', or a plain byte count, into bytes/sec."""
     s = s.strip().upper()
@@ -300,6 +309,8 @@ def main():
         sys.exit(1)
 
     out_root = Path(args.output)
+    grand_total_bytes = 0
+    grand_total_unknown = 0
 
     for creator_name in [c.strip() for c in args.creator.split(",") if c.strip()]:
         try:
@@ -317,6 +328,8 @@ def main():
         if args.channel:
             out_dir = out_dir / sanitize(args.channel)
         processed = 0
+        creator_total_bytes = 0
+        creator_total_unknown = 0
 
         for post in client.iter_posts(
             creator["id"], from_date=args.from_date, to_date=args.to_date, channel_id=channel_id
@@ -341,10 +354,6 @@ def main():
                     print(f"Skip (already downloaded): {fname}")
                     continue
 
-                if args.dry_run:
-                    print(f"Would download: {fname}")
-                    continue
-
                 try:
                     delivery = client.delivery_info(video_id)
                 except requests.HTTPError as e:
@@ -357,6 +366,17 @@ def main():
                     continue
 
                 variant, base = picked
+
+                if args.dry_run:
+                    size = variant.get("meta", {}).get("common", {}).get("size")
+                    if size:
+                        creator_total_bytes += size
+                        print(f"Would download: {fname}  ({human_size(size)})  [{variant.get('label', '?')}]")
+                    else:
+                        creator_total_unknown += 1
+                        print(f"Would download: {fname}  (size unknown)  [{variant.get('label', '?')}]")
+                    continue
+
                 url = resolve_url(variant, base)
                 print(f"Downloading: {fname}  [{variant.get('label', '?')}]")
                 try:
@@ -364,7 +384,20 @@ def main():
                 except (requests.RequestException, OSError) as e:
                     print(f"  ERROR downloading {fname}: {e}", file=sys.stderr)
 
-        print(f"-- {creator['title']}: processed {processed} post(s) --")
+        summary = f"-- {creator['title']}: processed {processed} post(s)"
+        if args.dry_run:
+            summary += f", estimated {human_size(creator_total_bytes)} to download"
+            if creator_total_unknown:
+                summary += f" ({creator_total_unknown} file(s) of unknown size not included)"
+            grand_total_bytes += creator_total_bytes
+            grand_total_unknown += creator_total_unknown
+        print(summary + " --")
+
+    if args.dry_run and len([c for c in args.creator.split(",") if c.strip()]) > 1:
+        total_line = f"\n== Total estimated download size: {human_size(grand_total_bytes)} =="
+        if grand_total_unknown:
+            total_line += f" ({grand_total_unknown} file(s) of unknown size not included)"
+        print(total_line)
 
 
 if __name__ == "__main__":
