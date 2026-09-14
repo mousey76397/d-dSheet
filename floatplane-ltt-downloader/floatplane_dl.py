@@ -36,6 +36,8 @@ CONNECTION_ERROR_BACKOFF = 10.0
 DELIVERY_INFO_MIN_INTERVAL = 2.0
 DRY_RUN_MAX_RATE_LIMIT_WAIT = 20
 
+FAILED_MANIFEST_NAME = "failed_downloads.json"
+
 
 class FloatplaneError(Exception):
     pass
@@ -290,6 +292,115 @@ def download_file(session: requests.Session, url: str, dest: Path, rate_limit: f
     tmp.rename(dest)
 
 
+def load_failed_manifest(out_root: Path) -> list[dict]:
+    path = out_root / FAILED_MANIFEST_NAME
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+def update_failed_manifest(out_root: Path, new_failures: list[dict]) -> list[dict]:
+    """Merge new_failures into the existing manifest, dropping any entry whose
+    file has since actually appeared on disk (downloaded some other way, e.g.
+    a prior --retry-failed run), and write the result back."""
+    by_video_id = {e["video_id"]: e for e in load_failed_manifest(out_root)}
+    for entry in new_failures:
+        by_video_id[entry["video_id"]] = entry
+    remaining = [e for e in by_video_id.values() if not Path(e["dest"]).exists()]
+
+    path = out_root / FAILED_MANIFEST_NAME
+    if not remaining:
+        if path.exists():
+            path.unlink()
+        return remaining
+    out_root.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(remaining, indent=2))
+    return remaining
+
+
+def find_partial_downloads(out_root: Path) -> list[Path]:
+    if not out_root.exists():
+        return []
+    return sorted(out_root.rglob("*.part"))
+
+
+def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, dest: Path, state: dict) -> None:
+    """Size-check (dry run) or download one video. Mutates `state`:
+    sizes_disabled (bool), total_bytes/total_unknown (dry-run counters),
+    and failed (list of {video_id, fname, dest, reason} dicts, real runs only).
+    """
+    if dest.exists():
+        print(f"Skip (already downloaded): {fname}")
+        return
+
+    if args.dry_run and state["sizes_disabled"]:
+        state["total_unknown"] += 1
+        print(f"Would download: {fname}  (size unknown - skipping lookups after rate limit)")
+        return
+
+    try:
+        delivery = client.delivery_info(video_id, max_wait=DRY_RUN_MAX_RATE_LIMIT_WAIT if args.dry_run else None)
+    except RateLimited as e:
+        state["sizes_disabled"] = True
+        state["total_unknown"] += 1
+        print(
+            f"  Floatplane asked to wait {e.retry_after}s on a size lookup - that's "
+            "longer than a dry run should block for, so size lookups are disabled for "
+            "the rest of this run (filenames will still list, just without sizes).",
+            file=sys.stderr,
+        )
+        print(f"Would download: {fname}  (size unknown - rate limited)")
+        return
+    except FloatplaneError as e:
+        print(f"  WARNING: could not fetch delivery info for {video_id}: {e}", file=sys.stderr)
+        if not args.dry_run:
+            state["failed"].append(
+                {"video_id": video_id, "fname": fname, "dest": str(dest), "reason": f"delivery info: {e}"}
+            )
+        return
+
+    picked = pick_variant(delivery, args.quality)
+    if not picked:
+        print(f"  WARNING: no downloadable variant for {video_id} ({fname})", file=sys.stderr)
+        if not args.dry_run:
+            state["failed"].append(
+                {"video_id": video_id, "fname": fname, "dest": str(dest), "reason": "no downloadable variant"}
+            )
+        return
+
+    variant, base = picked
+    url = resolve_url(variant, base)
+    if urlparse(url).path in ("", "/") and not urlparse(url).query:
+        print(
+            f"  WARNING: resolved URL for {video_id} is just a bare origin ({url}) - "
+            "Floatplane's delivery response likely doesn't match what this script "
+            f"expects anymore. Raw variant JSON: {json.dumps(variant)}",
+            file=sys.stderr,
+        )
+
+    if args.dry_run:
+        size = variant.get("meta", {}).get("common", {}).get("size")
+        if size:
+            state["total_bytes"] += size
+            print(f"Would download: {fname}  ({human_size(size)})  [{variant.get('label', '?')}]")
+        else:
+            state["total_unknown"] += 1
+            print(f"Would download: {fname}  (size unknown)  [{variant.get('label', '?')}]")
+        return
+
+    print(f"Downloading: {fname}  [{variant.get('label', '?')}]")
+    try:
+        download_file(client.session, url, dest, rate_limit=args.limit_rate)
+    except (requests.RequestException, OSError) as e:
+        print(f"  ERROR downloading {fname}: {e}", file=sys.stderr)
+        state["failed"].append(
+            {"video_id": video_id, "fname": fname, "dest": str(dest), "reason": f"download error: {e}"}
+        )
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
@@ -330,6 +441,13 @@ def parse_args():
         help="Cap download bandwidth, e.g. 500K, 2M, 1.5G (bytes/sec). "
         "Useful for a slow background run that shouldn't hog your connection.",
     )
+    p.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Ignore --creator/--channel/--from-date/--to-date/--limit and instead retry just the "
+        "files recorded as failed or skipped in <output>/failed_downloads.json from a previous run, "
+        "without re-listing the whole catalogue.",
+    )
     return p.parse_args()
 
 
@@ -357,123 +475,89 @@ def main():
     out_root = Path(args.output)
     grand_total_bytes = 0
     grand_total_unknown = 0
-    sizes_disabled = False
+    state = {"sizes_disabled": False, "total_bytes": 0, "total_unknown": 0, "failed": []}
 
-    for creator_name in [c.strip() for c in args.creator.split(",") if c.strip()]:
-        try:
-            creator = client.get_creator(creator_name)
-            channel_id = client.resolve_channel(creator, args.channel) if args.channel else None
-        except FloatplaneError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            continue
+    if args.retry_failed:
+        manifest = load_failed_manifest(out_root)
+        if not manifest:
+            print(f"No failed downloads recorded in {out_root / FAILED_MANIFEST_NAME}.")
+        else:
+            print(f"\n== Retrying {len(manifest)} previously failed/skipped file(s) ==")
+            for entry in manifest:
+                attempt_video(client, args, entry["video_id"], entry["fname"], Path(entry["dest"]), state)
+    else:
+        for creator_name in [c.strip() for c in args.creator.split(",") if c.strip()]:
+            try:
+                creator = client.get_creator(creator_name)
+                channel_id = client.resolve_channel(creator, args.channel) if args.channel else None
+            except FloatplaneError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                continue
 
-        label = f"{creator['title']} ({creator_name})"
-        if args.channel:
-            label += f" / {args.channel}"
-        print(f"\n== {label} ==")
-        out_dir = out_root / sanitize(creator["title"])
-        if args.channel:
-            out_dir = out_dir / sanitize(args.channel)
-        processed = 0
-        creator_total_bytes = 0
-        creator_total_unknown = 0
+            label = f"{creator['title']} ({creator_name})"
+            if args.channel:
+                label += f" / {args.channel}"
+            print(f"\n== {label} ==")
+            out_dir = out_root / sanitize(creator["title"])
+            if args.channel:
+                out_dir = out_dir / sanitize(args.channel)
+            processed = 0
+            state["total_bytes"] = 0
+            state["total_unknown"] = 0
 
-        try:
-            for post in client.iter_posts(
-                creator["id"], from_date=args.from_date, to_date=args.to_date, channel_id=channel_id
-            ):
-                if args.limit and processed >= args.limit:
-                    break
-                processed += 1
+            try:
+                for post in client.iter_posts(
+                    creator["id"], from_date=args.from_date, to_date=args.to_date, channel_id=channel_id
+                ):
+                    if args.limit and processed >= args.limit:
+                        break
+                    processed += 1
 
-                video_ids = post.get("videoAttachments") or []
-                if not video_ids:
-                    continue
-
-                date_str = (post.get("releaseDate") or "")[:10]
-                title = sanitize(post["title"])
-
-                for i, video_id in enumerate(video_ids):
-                    suffix = f" (part {i + 1})" if len(video_ids) > 1 else ""
-                    fname = f"{date_str} - {title}{suffix} [{video_id}].mp4"
-                    dest = out_dir / fname
-
-                    if dest.exists():
-                        print(f"Skip (already downloaded): {fname}")
+                    video_ids = post.get("videoAttachments") or []
+                    if not video_ids:
                         continue
 
-                    if args.dry_run and sizes_disabled:
-                        creator_total_unknown += 1
-                        print(f"Would download: {fname}  (size unknown - skipping lookups after rate limit)")
-                        continue
+                    date_str = (post.get("releaseDate") or "")[:10]
+                    title = sanitize(post["title"])
 
-                    try:
-                        delivery = client.delivery_info(
-                            video_id, max_wait=DRY_RUN_MAX_RATE_LIMIT_WAIT if args.dry_run else None
-                        )
-                    except RateLimited as e:
-                        sizes_disabled = True
-                        creator_total_unknown += 1
-                        print(
-                            f"  Floatplane asked to wait {e.retry_after}s on a size lookup - that's "
-                            "longer than a dry run should block for, so size lookups are disabled for "
-                            "the rest of this run (filenames will still list, just without sizes).",
-                            file=sys.stderr,
-                        )
-                        print(f"Would download: {fname}  (size unknown - rate limited)")
-                        continue
-                    except FloatplaneError as e:
-                        print(f"  WARNING: could not fetch delivery info for {video_id}: {e}", file=sys.stderr)
-                        continue
+                    for i, video_id in enumerate(video_ids):
+                        suffix = f" (part {i + 1})" if len(video_ids) > 1 else ""
+                        fname = f"{date_str} - {title}{suffix} [{video_id}].mp4"
+                        dest = out_dir / fname
+                        attempt_video(client, args, video_id, fname, dest, state)
+            except FloatplaneError as e:
+                print(f"ERROR: {e}", file=sys.stderr)
+                continue
 
-                    picked = pick_variant(delivery, args.quality)
-                    if not picked:
-                        print(f"  WARNING: no downloadable variant for {video_id} ({title})", file=sys.stderr)
-                        continue
+            summary = f"-- {creator['title']}: processed {processed} post(s)"
+            if args.dry_run:
+                summary += f", estimated {human_size(state['total_bytes'])} to download"
+                if state["total_unknown"]:
+                    summary += f" ({state['total_unknown']} file(s) of unknown size not included)"
+                grand_total_bytes += state["total_bytes"]
+                grand_total_unknown += state["total_unknown"]
+            print(summary + " --")
 
-                    variant, base = picked
-                    url = resolve_url(variant, base)
-                    if urlparse(url).path in ("", "/") and not urlparse(url).query:
-                        print(
-                            f"  WARNING: resolved URL for {video_id} is just a bare origin ({url}) - "
-                            "Floatplane's delivery response likely doesn't match what this script "
-                            f"expects anymore. Raw variant JSON: {json.dumps(variant)}",
-                            file=sys.stderr,
-                        )
+        if args.dry_run and len([c for c in args.creator.split(",") if c.strip()]) > 1:
+            total_line = f"\n== Total estimated download size: {human_size(grand_total_bytes)} =="
+            if grand_total_unknown:
+                total_line += f" ({grand_total_unknown} file(s) of unknown size not included)"
+            print(total_line)
 
-                    if args.dry_run:
-                        size = variant.get("meta", {}).get("common", {}).get("size")
-                        if size:
-                            creator_total_bytes += size
-                            print(f"Would download: {fname}  ({human_size(size)})  [{variant.get('label', '?')}]")
-                        else:
-                            creator_total_unknown += 1
-                            print(f"Would download: {fname}  (size unknown)  [{variant.get('label', '?')}]")
-                        continue
+    if not args.dry_run:
+        remaining_failed = update_failed_manifest(out_root, state["failed"])
+        if remaining_failed:
+            print(f"\n== {len(remaining_failed)} file(s) failed or were skipped due to errors ==")
+            for entry in remaining_failed:
+                print(f"  {entry['fname']}  ({entry['reason']})")
+            print(f"Recorded in {out_root / FAILED_MANIFEST_NAME} - re-run with --retry-failed to retry just these.")
 
-                    print(f"Downloading: {fname}  [{variant.get('label', '?')}]")
-                    try:
-                        download_file(client.session, url, dest, rate_limit=args.limit_rate)
-                    except (requests.RequestException, OSError) as e:
-                        print(f"  ERROR downloading {fname}: {e}", file=sys.stderr)
-        except FloatplaneError as e:
-            print(f"ERROR: {e}", file=sys.stderr)
-            continue
-
-        summary = f"-- {creator['title']}: processed {processed} post(s)"
-        if args.dry_run:
-            summary += f", estimated {human_size(creator_total_bytes)} to download"
-            if creator_total_unknown:
-                summary += f" ({creator_total_unknown} file(s) of unknown size not included)"
-            grand_total_bytes += creator_total_bytes
-            grand_total_unknown += creator_total_unknown
-        print(summary + " --")
-
-    if args.dry_run and len([c for c in args.creator.split(",") if c.strip()]) > 1:
-        total_line = f"\n== Total estimated download size: {human_size(grand_total_bytes)} =="
-        if grand_total_unknown:
-            total_line += f" ({grand_total_unknown} file(s) of unknown size not included)"
-        print(total_line)
+    partials = find_partial_downloads(out_root)
+    if partials:
+        print(f"\n== {len(partials)} unfinished (partial) download(s) ==")
+        for p in partials:
+            print(f"  {p.relative_to(out_root)}  ({human_size(p.stat().st_size)} so far)")
+        print("These resume automatically the next time you run the same command.")
 
 
 if __name__ == "__main__":

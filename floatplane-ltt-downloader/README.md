@@ -67,6 +67,9 @@ FLOATPLANE_SID="..." python3 floatplane_dl.py --from-date 2024-01-01
 
 # See what would be downloaded without actually downloading anything
 FLOATPLANE_SID="..." python3 floatplane_dl.py --dry-run
+
+# After a run that had failures, retry just those without re-scanning everything
+FLOATPLANE_SID="..." python3 floatplane_dl.py --retry-failed --output /media/LTT
 ```
 
 Run `python3 floatplane_dl.py --help` for all options.
@@ -135,6 +138,22 @@ one.
   (remaining files just list as "size unknown" instead of the whole run
   stalling for however long Floatplane asked for). This doesn't apply to a
   real download run, where the download itself already spaces requests out.
+- When a real run finishes, anything that failed or was skipped due to an
+  error (couldn't fetch delivery info, no downloadable variant, a download
+  that errored out) is listed by filename and reason, and recorded in
+  `<output>/failed_downloads.json`. Run again with `--retry-failed` to
+  retry just those - it reads that file directly instead of re-listing
+  the whole catalogue, so it's fast even against a huge back-catalogue and
+  doesn't need `--creator`/`--channel`/`--from-date`/etc. (those are
+  ignored in this mode, since the file already has everything it needs
+  per entry). An entry is dropped from the file once its download
+  actually succeeds, whether via `--retry-failed` or because a later
+  normal run happened to cover it too.
+- Separately, any `.mp4.part` files left sitting in `--output` (a download
+  that was cut off mid-transfer, whether from this run or an interrupted
+  one from before) are listed at the end too. These don't need
+  `--retry-failed` - just running the same command again resumes them via
+  the `Range`-resume behavior above.
 
 ## Known limitations
 
