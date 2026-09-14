@@ -94,7 +94,14 @@ class FloatplaneClient:
                 print(f"  Rate limited by Floatplane, waiting {wait}s...", file=sys.stderr)
                 time.sleep(wait)
                 continue
-            r.raise_for_status()
+            if not r.ok:
+                hint = ""
+                if r.status_code in (401, 403):
+                    hint = (
+                        " Your cookie may be expired/invalid, or your account's subscription "
+                        "doesn't cover this creator/channel's content."
+                    )
+                raise FloatplaneError(f"Floatplane returned {r.status_code} for {path}.{hint}")
             return r.json()
         raise FloatplaneError(f"Repeated rate limiting on {path}, giving up")
 
@@ -118,9 +125,10 @@ class FloatplaneClient:
 
     def verify_session(self) -> None:
         r = self.session.get(f"{API_BASE}/v3/user/self", timeout=30)
-        if r.status_code == 401:
+        if r.status_code in (401, 403):
             raise FloatplaneError(
-                "Not authenticated. Your cookie may be expired/invalid, or login failed. "
+                f"Not authenticated ({r.status_code}). Your cookie may be expired/invalid, login may "
+                "have failed, or Floatplane's edge is blocking this client. "
                 "See README.md for how to obtain a fresh sails.sid cookie."
             )
         r.raise_for_status()
@@ -356,76 +364,80 @@ def main():
         creator_total_bytes = 0
         creator_total_unknown = 0
 
-        for post in client.iter_posts(
-            creator["id"], from_date=args.from_date, to_date=args.to_date, channel_id=channel_id
-        ):
-            if args.limit and processed >= args.limit:
-                break
-            processed += 1
+        try:
+            for post in client.iter_posts(
+                creator["id"], from_date=args.from_date, to_date=args.to_date, channel_id=channel_id
+            ):
+                if args.limit and processed >= args.limit:
+                    break
+                processed += 1
 
-            video_ids = post.get("videoAttachments") or []
-            if not video_ids:
-                continue
-
-            date_str = (post.get("releaseDate") or "")[:10]
-            title = sanitize(post["title"])
-
-            for i, video_id in enumerate(video_ids):
-                suffix = f" (part {i + 1})" if len(video_ids) > 1 else ""
-                fname = f"{date_str} - {title}{suffix} [{video_id}].mp4"
-                dest = out_dir / fname
-
-                if dest.exists():
-                    print(f"Skip (already downloaded): {fname}")
+                video_ids = post.get("videoAttachments") or []
+                if not video_ids:
                     continue
 
-                if args.dry_run and sizes_disabled:
-                    creator_total_unknown += 1
-                    print(f"Would download: {fname}  (size unknown - skipping lookups after rate limit)")
-                    continue
+                date_str = (post.get("releaseDate") or "")[:10]
+                title = sanitize(post["title"])
 
-                try:
-                    delivery = client.delivery_info(
-                        video_id, max_wait=DRY_RUN_MAX_RATE_LIMIT_WAIT if args.dry_run else None
-                    )
-                except RateLimited as e:
-                    sizes_disabled = True
-                    creator_total_unknown += 1
-                    print(
-                        f"  Floatplane asked to wait {e.retry_after}s on a size lookup - that's "
-                        "longer than a dry run should block for, so size lookups are disabled for "
-                        "the rest of this run (filenames will still list, just without sizes).",
-                        file=sys.stderr,
-                    )
-                    print(f"Would download: {fname}  (size unknown - rate limited)")
-                    continue
-                except requests.HTTPError as e:
-                    print(f"  WARNING: could not fetch delivery info for {video_id}: {e}", file=sys.stderr)
-                    continue
+                for i, video_id in enumerate(video_ids):
+                    suffix = f" (part {i + 1})" if len(video_ids) > 1 else ""
+                    fname = f"{date_str} - {title}{suffix} [{video_id}].mp4"
+                    dest = out_dir / fname
 
-                picked = pick_variant(delivery, args.quality)
-                if not picked:
-                    print(f"  WARNING: no downloadable variant for {video_id} ({title})", file=sys.stderr)
-                    continue
+                    if dest.exists():
+                        print(f"Skip (already downloaded): {fname}")
+                        continue
 
-                variant, base = picked
-
-                if args.dry_run:
-                    size = variant.get("meta", {}).get("common", {}).get("size")
-                    if size:
-                        creator_total_bytes += size
-                        print(f"Would download: {fname}  ({human_size(size)})  [{variant.get('label', '?')}]")
-                    else:
+                    if args.dry_run and sizes_disabled:
                         creator_total_unknown += 1
-                        print(f"Would download: {fname}  (size unknown)  [{variant.get('label', '?')}]")
-                    continue
+                        print(f"Would download: {fname}  (size unknown - skipping lookups after rate limit)")
+                        continue
 
-                url = resolve_url(variant, base)
-                print(f"Downloading: {fname}  [{variant.get('label', '?')}]")
-                try:
-                    download_file(client.session, url, dest, rate_limit=args.limit_rate)
-                except (requests.RequestException, OSError) as e:
-                    print(f"  ERROR downloading {fname}: {e}", file=sys.stderr)
+                    try:
+                        delivery = client.delivery_info(
+                            video_id, max_wait=DRY_RUN_MAX_RATE_LIMIT_WAIT if args.dry_run else None
+                        )
+                    except RateLimited as e:
+                        sizes_disabled = True
+                        creator_total_unknown += 1
+                        print(
+                            f"  Floatplane asked to wait {e.retry_after}s on a size lookup - that's "
+                            "longer than a dry run should block for, so size lookups are disabled for "
+                            "the rest of this run (filenames will still list, just without sizes).",
+                            file=sys.stderr,
+                        )
+                        print(f"Would download: {fname}  (size unknown - rate limited)")
+                        continue
+                    except FloatplaneError as e:
+                        print(f"  WARNING: could not fetch delivery info for {video_id}: {e}", file=sys.stderr)
+                        continue
+
+                    picked = pick_variant(delivery, args.quality)
+                    if not picked:
+                        print(f"  WARNING: no downloadable variant for {video_id} ({title})", file=sys.stderr)
+                        continue
+
+                    variant, base = picked
+
+                    if args.dry_run:
+                        size = variant.get("meta", {}).get("common", {}).get("size")
+                        if size:
+                            creator_total_bytes += size
+                            print(f"Would download: {fname}  ({human_size(size)})  [{variant.get('label', '?')}]")
+                        else:
+                            creator_total_unknown += 1
+                            print(f"Would download: {fname}  (size unknown)  [{variant.get('label', '?')}]")
+                        continue
+
+                    url = resolve_url(variant, base)
+                    print(f"Downloading: {fname}  [{variant.get('label', '?')}]")
+                    try:
+                        download_file(client.session, url, dest, rate_limit=args.limit_rate)
+                    except (requests.RequestException, OSError) as e:
+                        print(f"  ERROR downloading {fname}: {e}", file=sys.stderr)
+        except FloatplaneError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            continue
 
         summary = f"-- {creator['title']}: processed {processed} post(s)"
         if args.dry_run:

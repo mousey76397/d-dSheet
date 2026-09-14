@@ -31,6 +31,12 @@ password:
 This cookie expires after a while — if the script reports it's no longer
 authenticated, just grab a fresh one the same way.
 
+This value logs you in as you until it expires — treat it like a password.
+Prefer `FLOATPLANE_SID` over `--cookie` so it doesn't end up in your shell
+history, and never paste it into a chat, issue, or support request; if it
+ever does leak, log out of that session (or change your Floatplane password,
+which invalidates all sessions) and grab a fresh one.
+
 Alternatively you can pass `--username`/`--password` (or `FLOATPLANE_USER`/
 `FLOATPLANE_PASS`), and the script will log in directly and prompt for a 2FA
 code if your account has it enabled. If Floatplane responds asking for a
@@ -133,3 +139,23 @@ one.
 - Built against Floatplane's community-documented API
   (github.com/jamamp/FloatplaneAPI). Floatplane can change this without
   notice, which would break the script.
+
+## Troubleshooting
+
+**`403` errors** mean the request reached Floatplane but was rejected —
+different from a network problem. The script now reports a clear message
+naming the failing endpoint (rather than crashing with a raw traceback) with
+one of two likely causes:
+
+- **Cookie expired/invalid.** `sails.sid` cookies expire; grab a fresh one
+  (see Authentication above). Floatplane sometimes returns `403` instead of
+  `401` for this depending on where the request gets rejected.
+- **Your subscription doesn't cover the creator or sub-channel you asked
+  for.** In particular, LTT's `fpexclusive` sub-channel has historically
+  required a specific membership tier, not just any Linus Tech Tips
+  subscription — check on floatplane.com that your plan actually includes
+  the content you're trying to fetch.
+
+If neither explains it, Floatplane's edge (Cloudflare) may be blocking the
+client outright — there's no user-side fix for that beyond trying again
+later or from a different network.
