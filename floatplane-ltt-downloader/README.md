@@ -105,6 +105,14 @@ one.
   warning.
 - Requests are retried automatically if Floatplane responds with `429 Too
   Many Requests`, honouring its `Retry-After` header.
+- API calls (post listing, delivery info) also retry automatically through a
+  dropped connection or DNS blip (up to 6 attempts, backing off 10s further
+  each time) instead of crashing the whole run over a momentary Wi-Fi/ISP
+  hiccup - important for a run that's meant to sit unattended for hours. If
+  a video's actual byte download drops mid-transfer, that one file is
+  skipped (with an error printed) rather than retried in place; re-running
+  the same command later picks it back up via the `Range`-resume behavior
+  above.
 - `--limit-rate` caps average download bandwidth (per file, not aggregate),
   e.g. `--limit-rate 500K`, `--limit-rate 2M`, `--limit-rate 1.5G`. Handy
   for a slow, unattended run that shouldn't compete with everything else

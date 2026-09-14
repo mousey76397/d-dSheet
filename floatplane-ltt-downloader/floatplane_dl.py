@@ -25,6 +25,7 @@ DEFAULT_UA = "FloatplaneLTTDownloader/1.0 (CFNetwork)"
 
 CHUNK_SIZE = 1024 * 1024
 MAX_RATE_LIMIT_RETRIES = 6
+CONNECTION_ERROR_BACKOFF = 10.0
 
 # Floatplane's delivery/info endpoint (the one that returns a video's download
 # URL and size) throttles much more aggressively than its other endpoints when
@@ -88,7 +89,18 @@ class FloatplaneClient:
     def _get(self, path: str, max_wait: float | None = None, **params):
         url = f"{API_BASE}{path}"
         for attempt in range(MAX_RATE_LIMIT_RETRIES):
-            r = self.session.get(url, params=params, timeout=30)
+            try:
+                r = self.session.get(url, params=params, timeout=30)
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                if attempt == MAX_RATE_LIMIT_RETRIES - 1:
+                    raise FloatplaneError(
+                        f"Network error talking to Floatplane on {path} after "
+                        f"{MAX_RATE_LIMIT_RETRIES} attempts: {e}"
+                    )
+                wait = CONNECTION_ERROR_BACKOFF * (attempt + 1)
+                print(f"  Network error on {path} ({e.__class__.__name__}), retrying in {wait}s...", file=sys.stderr)
+                time.sleep(wait)
+                continue
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 5))
                 if max_wait is not None and wait > max_wait:
