@@ -113,6 +113,14 @@ one.
   than silently under-counting the total. Because this needs Floatplane's
   per-video delivery info to get a size, `--dry-run` makes the same number
   of API calls as a real run — it just skips the actual video download.
+- Floatplane throttles that per-video delivery-info lookup much harder than
+  its other endpoints when it's hit back-to-back with no download in
+  between, which a `--dry-run` size scan does by nature. To cope: calls are
+  paced a couple of seconds apart, and if Floatplane still asks for a wait
+  longer than 20s, size lookups are dropped for the rest of that dry run
+  (remaining files just list as "size unknown" instead of the whole run
+  stalling for however long Floatplane asked for). This doesn't apply to a
+  real download run, where the download itself already spaces requests out.
 
 ## Known limitations
 

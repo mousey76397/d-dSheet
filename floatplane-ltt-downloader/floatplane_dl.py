@@ -24,9 +24,24 @@ DEFAULT_UA = "FloatplaneLTTDownloader/1.0 (CFNetwork)"
 CHUNK_SIZE = 1024 * 1024
 MAX_RATE_LIMIT_RETRIES = 6
 
+# Floatplane's delivery/info endpoint (the one that returns a video's download
+# URL and size) throttles much more aggressively than its other endpoints when
+# hit back-to-back with no download in between - as dry-run size lookups do.
+# Space calls out to stay under that, and cap how long dry-run is willing to
+# block on a single 429 before giving up on sizes rather than stalling for
+# whatever (large) Retry-After Floatplane sent.
+DELIVERY_INFO_MIN_INTERVAL = 2.0
+DRY_RUN_MAX_RATE_LIMIT_WAIT = 20
+
 
 class FloatplaneError(Exception):
     pass
+
+
+class RateLimited(FloatplaneError):
+    def __init__(self, retry_after: int):
+        self.retry_after = retry_after
+        super().__init__(f"Rate limited, Retry-After={retry_after}s")
 
 
 def sanitize(name: str) -> str:
@@ -66,13 +81,16 @@ class FloatplaneClient:
         self.session.headers.update({"User-Agent": user_agent, "Accept": "application/json"})
         if cookie:
             self.session.cookies.set("sails.sid", cookie, domain=".floatplane.com")
+        self._last_delivery_info_call = 0.0
 
-    def _get(self, path: str, **params):
+    def _get(self, path: str, max_wait: float | None = None, **params):
         url = f"{API_BASE}{path}"
         for attempt in range(MAX_RATE_LIMIT_RETRIES):
             r = self.session.get(url, params=params, timeout=30)
             if r.status_code == 429:
                 wait = int(r.headers.get("Retry-After", 5))
+                if max_wait is not None and wait > max_wait:
+                    raise RateLimited(wait)
                 print(f"  Rate limited by Floatplane, waiting {wait}s...", file=sys.stderr)
                 time.sleep(wait)
                 continue
@@ -154,8 +172,14 @@ class FloatplaneClient:
                 return
             fetch_after += page_size
 
-    def delivery_info(self, entity_id: str) -> dict:
-        return self._get("/v3/delivery/info", scenario="download", entityId=entity_id)
+    def delivery_info(self, entity_id: str, max_wait: float | None = None) -> dict:
+        elapsed = time.monotonic() - self._last_delivery_info_call
+        if elapsed < DELIVERY_INFO_MIN_INTERVAL:
+            time.sleep(DELIVERY_INFO_MIN_INTERVAL - elapsed)
+        try:
+            return self._get("/v3/delivery/info", max_wait=max_wait, scenario="download", entityId=entity_id)
+        finally:
+            self._last_delivery_info_call = time.monotonic()
 
 
 def pick_variant(delivery: dict, preferred_label: str | None):
@@ -311,6 +335,7 @@ def main():
     out_root = Path(args.output)
     grand_total_bytes = 0
     grand_total_unknown = 0
+    sizes_disabled = False
 
     for creator_name in [c.strip() for c in args.creator.split(",") if c.strip()]:
         try:
@@ -354,8 +379,26 @@ def main():
                     print(f"Skip (already downloaded): {fname}")
                     continue
 
+                if args.dry_run and sizes_disabled:
+                    creator_total_unknown += 1
+                    print(f"Would download: {fname}  (size unknown - skipping lookups after rate limit)")
+                    continue
+
                 try:
-                    delivery = client.delivery_info(video_id)
+                    delivery = client.delivery_info(
+                        video_id, max_wait=DRY_RUN_MAX_RATE_LIMIT_WAIT if args.dry_run else None
+                    )
+                except RateLimited as e:
+                    sizes_disabled = True
+                    creator_total_unknown += 1
+                    print(
+                        f"  Floatplane asked to wait {e.retry_after}s on a size lookup - that's "
+                        "longer than a dry run should block for, so size lookups are disabled for "
+                        "the rest of this run (filenames will still list, just without sizes).",
+                        file=sys.stderr,
+                    )
+                    print(f"Would download: {fname}  (size unknown - rate limited)")
+                    continue
                 except requests.HTTPError as e:
                     print(f"  WARNING: could not fetch delivery info for {video_id}: {e}", file=sys.stderr)
                     continue
