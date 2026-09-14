@@ -6,11 +6,13 @@ See README.md for authentication setup.
 """
 
 import argparse
+import json
 import os
 import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -418,6 +420,14 @@ def main():
                         continue
 
                     variant, base = picked
+                    url = resolve_url(variant, base)
+                    if urlparse(url).path in ("", "/") and not urlparse(url).query:
+                        print(
+                            f"  WARNING: resolved URL for {video_id} is just a bare origin ({url}) - "
+                            "Floatplane's delivery response likely doesn't match what this script "
+                            f"expects anymore. Raw variant JSON: {json.dumps(variant)}",
+                            file=sys.stderr,
+                        )
 
                     if args.dry_run:
                         size = variant.get("meta", {}).get("common", {}).get("size")
@@ -429,7 +439,6 @@ def main():
                             print(f"Would download: {fname}  (size unknown)  [{variant.get('label', '?')}]")
                         continue
 
-                    url = resolve_url(variant, base)
                     print(f"Downloading: {fname}  [{variant.get('label', '?')}]")
                     try:
                         download_file(client.session, url, dest, rate_limit=args.limit_rate)
