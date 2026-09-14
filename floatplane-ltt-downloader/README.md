@@ -50,8 +50,11 @@ FLOATPLANE_SID="..." python3 floatplane_dl.py --quality 1080p --output /media/LT
 # Cap bandwidth at 2 MB/s so it can just run in the background for days
 FLOATPLANE_SID="..." python3 floatplane_dl.py --limit-rate 2M
 
-# Multiple LMG channels in one run
+# Multiple LMG creators in one run
 FLOATPLANE_SID="..." python3 floatplane_dl.py --creator linustechtips,techlinked,techquickie
+
+# Just the Floatplane Exclusive sub-channel of LTT (not a separate creator - see note below)
+FLOATPLANE_SID="..." python3 floatplane_dl.py --channel fpexclusive
 
 # Only content from 2024 onward
 FLOATPLANE_SID="..." python3 floatplane_dl.py --from-date 2024-01-01
@@ -61,6 +64,27 @@ FLOATPLANE_SID="..." python3 floatplane_dl.py --dry-run
 ```
 
 Run `python3 floatplane_dl.py --help` for all options.
+
+### Creators vs. sub-channels
+
+`--creator` selects between separate LMG accounts on Floatplane (linustechtips,
+techlinked, techquickie, ...). "Floatplane Exclusive" is *not* one of these -
+it's a sub-channel that lives under the `linustechtips` creator itself, the
+same way "Main", "Behind the Scenes", and "Livestreams" do. Passing
+`--creator fpexclusive` will fail with a "Creator not found" error because
+Floatplane doesn't have a creator by that name.
+
+To get just that content, use `--channel` instead, which filters posts by
+sub-channel `urlname` within whichever creator(s) `--creator` selects
+(default: `linustechtips`):
+
+```bash
+FLOATPLANE_SID="..." python3 floatplane_dl.py --channel fpexclusive
+```
+
+If the `urlname` you pass doesn't match any sub-channel on that creator, the
+script prints the sub-channels it does know about so you can pick the right
+one.
 
 ## Behaviour
 

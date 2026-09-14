@@ -104,7 +104,30 @@ class FloatplaneClient:
             raise FloatplaneError(f"Creator '{urlname}' not found.")
         return data[0]
 
-    def iter_posts(self, creator_id: str, page_size: int = 20, from_date: str | None = None, to_date: str | None = None):
+    def resolve_channel(self, creator: dict, channel_urlname: str) -> str:
+        """Resolve a sub-channel URL name (e.g. 'fpexclusive') to its channel id.
+
+        Sub-channels (Main, Behind the Scenes, FP Exclusive, ...) are not
+        separate creators - they're listed under the creator's own 'channels'.
+        """
+        channels = creator.get("channels") or []
+        for channel in channels:
+            if channel.get("urlname", "").lower() == channel_urlname.lower():
+                return channel["id"]
+        available = ", ".join(c.get("urlname", "?") for c in channels) or "none"
+        raise FloatplaneError(
+            f"Channel '{channel_urlname}' not found under creator '{creator.get('urlname')}'. "
+            f"Available channels: {available}"
+        )
+
+    def iter_posts(
+        self,
+        creator_id: str,
+        page_size: int = 20,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        channel_id: str | None = None,
+    ):
         fetch_after = 0
         while True:
             params = {"id": creator_id, "limit": page_size, "fetchAfter": fetch_after, "sort": "ASC"}
@@ -112,6 +135,8 @@ class FloatplaneClient:
                 params["fromDate"] = from_date
             if to_date:
                 params["toDate"] = to_date
+            if channel_id:
+                params["channel"] = channel_id
             batch = self._get("/v3/content/creator", **params)
             if not batch:
                 return
@@ -215,11 +240,21 @@ def parse_args():
     p.add_argument(
         "--creator",
         default="linustechtips",
-        help="Comma-separated Floatplane creator URL name(s). "
-        "LMG channels include: linustechtips, techlinked, techquickie, "
-        "shortcircuit, channelsuperfun, gamerslexicon. Default: linustechtips",
+        help="Comma-separated Floatplane creator URL name(s), each a separate LMG account. "
+        "Includes: linustechtips, techlinked, techquickie, "
+        "shortcircuit, channelsuperfun, gamerslexicon. Default: linustechtips. "
+        "Not the same as a creator's sub-channels (e.g. LTT's fpexclusive) - see --channel.",
     )
     p.add_argument("--output", default="./floatplane-downloads", help="Output directory")
+    p.add_argument(
+        "--channel",
+        default=None,
+        help="Only download posts from this sub-channel of the creator, e.g. 'fpexclusive' for "
+        "LTT's Floatplane Exclusive content. Sub-channels (Main, Behind the Scenes, FP Exclusive, "
+        "Livestreams, ...) live under a single creator, unlike --creator which selects between "
+        "separate LMG creator accounts (linustechtips, techlinked, ...). Applied to every creator "
+        "given via --creator; run separately per creator if their channel lists differ.",
+    )
     p.add_argument(
         "--cookie",
         default=os.environ.get("FLOATPLANE_SID"),
@@ -269,15 +304,23 @@ def main():
     for creator_name in [c.strip() for c in args.creator.split(",") if c.strip()]:
         try:
             creator = client.get_creator(creator_name)
+            channel_id = client.resolve_channel(creator, args.channel) if args.channel else None
         except FloatplaneError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             continue
 
-        print(f"\n== {creator['title']} ({creator_name}) ==")
+        label = f"{creator['title']} ({creator_name})"
+        if args.channel:
+            label += f" / {args.channel}"
+        print(f"\n== {label} ==")
         out_dir = out_root / sanitize(creator["title"])
+        if args.channel:
+            out_dir = out_dir / sanitize(args.channel)
         processed = 0
 
-        for post in client.iter_posts(creator["id"], from_date=args.from_date, to_date=args.to_date):
+        for post in client.iter_posts(
+            creator["id"], from_date=args.from_date, to_date=args.to_date, channel_id=channel_id
+        ):
             if args.limit and processed >= args.limit:
                 break
             processed += 1
