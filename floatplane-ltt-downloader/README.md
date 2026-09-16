@@ -149,11 +149,17 @@ one.
   per entry). An entry is dropped from the file once its download
   actually succeeds, whether via `--retry-failed` or because a later
   normal run happened to cover it too.
-- Separately, any `.mp4.part` files left sitting in `--output` (a download
-  that was cut off mid-transfer, whether from this run or an interrupted
-  one from before) are listed at the end too. These don't need
-  `--retry-failed` - just running the same command again resumes them via
-  the `Range`-resume behavior above.
+- Any `.mp4.part` file left sitting anywhere in `--output` - a download cut
+  off mid-transfer, whether from this run, an earlier one, or the process
+  getting killed/interrupted outright - is automatically resumed and
+  finished at the end of every real (non `--dry-run`) run, before the
+  final report; the video id needed to do that is recovered straight from
+  the filename, so this doesn't depend on that file having a
+  `failed_downloads.json` entry (a hard kill leaves the `.part` behind but
+  never gets the chance to record one). Anything still incomplete after
+  that retry - Floatplane down, or failing again for some other reason -
+  is listed at the end so you know it needs another pass. Under
+  `--dry-run` these are only listed, never touched.
 
 ## Known limitations
 

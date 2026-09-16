@@ -327,6 +327,16 @@ def find_partial_downloads(out_root: Path) -> list[Path]:
     return sorted(out_root.rglob("*.part"))
 
 
+VIDEO_ID_RE = re.compile(r"\[([^\[\]]+)\]\.mp4$")
+
+
+def video_id_from_filename(fname: str) -> str | None:
+    """Recover the video id embedded in a "...[id].mp4" filename, e.g. to
+    resume a leftover .part file without needing to re-list the catalogue."""
+    m = VIDEO_ID_RE.search(fname)
+    return m.group(1) if m else None
+
+
 def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, dest: Path, state: dict) -> None:
     """Size-check (dry run) or download one video. Mutates `state`:
     sizes_disabled (bool), total_bytes/total_unknown (dry-run counters),
@@ -545,6 +555,18 @@ def main():
             print(total_line)
 
     if not args.dry_run:
+        partials = find_partial_downloads(out_root)
+        if partials:
+            print(f"\n== Resuming {len(partials)} unfinished (partial) download(s) ==")
+            for p in partials:
+                dest = p.with_suffix("")  # "...[id].mp4.part" -> "...[id].mp4"
+                fname = dest.name
+                video_id = video_id_from_filename(fname)
+                if not video_id:
+                    print(f"  WARNING: couldn't recover a video id from {fname}, leaving it as-is", file=sys.stderr)
+                    continue
+                attempt_video(client, args, video_id, fname, dest, state)
+
         remaining_failed = update_failed_manifest(out_root, state["failed"])
         if remaining_failed:
             print(f"\n== {len(remaining_failed)} file(s) failed or were skipped due to errors ==")
@@ -552,12 +574,19 @@ def main():
                 print(f"  {entry['fname']}  ({entry['reason']})")
             print(f"Recorded in {out_root / FAILED_MANIFEST_NAME} - re-run with --retry-failed to retry just these.")
 
-    partials = find_partial_downloads(out_root)
-    if partials:
-        print(f"\n== {len(partials)} unfinished (partial) download(s) ==")
-        for p in partials:
-            print(f"  {p.relative_to(out_root)}  ({human_size(p.stat().st_size)} so far)")
-        print("These resume automatically the next time you run the same command.")
+        still_partial = find_partial_downloads(out_root)
+        if still_partial:
+            print(f"\n== {len(still_partial)} download(s) still unfinished after retrying ==")
+            for p in still_partial:
+                print(f"  {p.relative_to(out_root)}  ({human_size(p.stat().st_size)} so far)")
+            print("Re-run the same command (or --retry-failed) to keep trying.")
+    else:
+        partials = find_partial_downloads(out_root)
+        if partials:
+            print(f"\n== {len(partials)} unfinished (partial) download(s) ==")
+            for p in partials:
+                print(f"  {p.relative_to(out_root)}  ({human_size(p.stat().st_size)} so far)")
+            print("A real (non --dry-run) run will resume these automatically.")
 
 
 if __name__ == "__main__":
