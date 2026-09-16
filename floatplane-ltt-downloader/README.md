@@ -70,6 +70,9 @@ FLOATPLANE_SID="..." python3 floatplane_dl.py --dry-run
 
 # After a run that had failures, retry just those without re-scanning everything
 FLOATPLANE_SID="..." python3 floatplane_dl.py --retry-failed --output /media/LTT
+
+# Getting rate-limited on small files? Raise the floor between videos
+FLOATPLANE_SID="..." python3 floatplane_dl.py --min-video-interval 30
 ```
 
 Run `python3 floatplane_dl.py --help` for all options.
@@ -138,7 +141,22 @@ one.
 - `--limit-rate` caps average download bandwidth (per file, not aggregate),
   e.g. `--limit-rate 500K`, `--limit-rate 2M`, `--limit-rate 1.5G`. Handy
   for a slow, unattended run that shouldn't compete with everything else
-  on your connection.
+  on your connection. This throttles the video's own byte transfer - it
+  has nothing to do with the delivery-info rate limiting above, since
+  that's a completely different request that happens before any bytes are
+  transferred at all.
+- `--min-video-interval` (default 15s) targets the actual cause of that
+  rate limiting on small files specifically: a big file's download time
+  naturally spaces out how often the delivery-info endpoint gets hit, but
+  a small file finishes almost instantly and removes that spacing
+  entirely. Rather than throttle bandwidth (which barely delays a
+  genuinely small file even throttled hard, since there isn't much to
+  transfer), this pads the *idle time* after a video that finished faster
+  than the floor, up to that floor - a big file that already took longer
+  than this isn't slowed down further. Real downloads only; `--dry-run`
+  has its own separate, faster-failing mitigation for the same endpoint
+  since it never downloads anything to naturally pace against. Set to 0
+  to disable.
 - `--dry-run` prints the size of each video (from Floatplane's own metadata,
   at whatever `--quality` would be picked) plus a per-creator and overall
   total, so you can check free disk space before committing to a big

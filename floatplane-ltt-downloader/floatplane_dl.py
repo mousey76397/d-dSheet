@@ -372,6 +372,24 @@ def video_id_from_filename(fname: str) -> str | None:
     return m.group(1) if m else None
 
 
+def top_up_video_interval(args, video_start: float) -> None:
+    """Pad the time spent on a real download up to --min-video-interval.
+
+    A big file's own download time already provides natural spacing before
+    the next video's delivery-info call; a small file finishes almost
+    instantly and removes that spacing entirely, which is when Floatplane's
+    rate limit on that endpoint tends to bite. Only called on the real
+    (non dry-run) download path - dry-run has its own separate, faster-
+    failing mitigation for the same endpoint since it never downloads
+    anything to naturally pace against.
+    """
+    if args.min_video_interval <= 0:
+        return
+    remaining = args.min_video_interval - (time.monotonic() - video_start)
+    if remaining > 0:
+        time.sleep(remaining)
+
+
 def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, dest: Path, state: dict) -> None:
     """Size-check (dry run) or download one video. Mutates `state`:
     sizes_disabled (bool), total_bytes/total_unknown (dry-run counters),
@@ -386,6 +404,7 @@ def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, des
         print(f"Would download: {fname}  (size unknown - skipping lookups after rate limit)")
         return
 
+    video_start = time.monotonic()
     try:
         delivery = client.delivery_info(video_id, max_wait=DRY_RUN_MAX_RATE_LIMIT_WAIT if args.dry_run else None)
     except RateLimited as e:
@@ -405,6 +424,7 @@ def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, des
             state["failed"].append(
                 {"video_id": video_id, "fname": fname, "dest": str(dest), "reason": f"delivery info: {e}"}
             )
+            top_up_video_interval(args, video_start)
         return
 
     picked = pick_variant(delivery, args.quality)
@@ -414,6 +434,7 @@ def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, des
             state["failed"].append(
                 {"video_id": video_id, "fname": fname, "dest": str(dest), "reason": "no downloadable variant"}
             )
+            top_up_video_interval(args, video_start)
         return
 
     variant, base = picked
@@ -444,6 +465,7 @@ def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, des
         state["failed"].append(
             {"video_id": video_id, "fname": fname, "dest": str(dest), "reason": f"download error: {e}"}
         )
+    top_up_video_interval(args, video_start)
 
 
 def parse_args():
@@ -492,6 +514,18 @@ def parse_args():
         help="Ignore --creator/--channel/--from-date/--to-date/--limit and instead retry just the "
         "files recorded as failed or skipped in <output>/failed_downloads.json from a previous run, "
         "without re-listing the whole catalogue.",
+    )
+    p.add_argument(
+        "--min-video-interval",
+        type=float,
+        default=15.0,
+        help="Minimum seconds spent per video before moving to the next one, on real downloads only "
+        "(0 disables this). A big file's own download time already spaces out how often Floatplane's "
+        "per-video delivery-info lookup gets hit; a small file finishes almost instantly and removes "
+        "that spacing, which is when that endpoint tends to get rate-limited. Small files get padded "
+        "with idle time up to this floor; big files that already take longer than this aren't slowed "
+        "down further. This is unrelated to --limit-rate, which caps the download's own byte-transfer "
+        "speed rather than the gap between videos.",
     )
     return p.parse_args()
 
