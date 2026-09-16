@@ -327,6 +327,31 @@ def download_file(session: requests.Session, url: str, dest: Path, rate_limit: f
     tmp.rename(dest)
 
 
+def download_thumbnail(session: requests.Session, thumbnail: dict | None, dest: Path) -> None:
+    """Save a post's thumbnail next to its video as <video-basename>.jpg -
+    Plex (and most other media managers) pick up a same-named image file
+    next to a video as that episode's local artwork automatically, with no
+    online metadata matching required.
+    """
+    if not thumbnail or not thumbnail.get("path"):
+        return
+    ext = Path(urlparse(thumbnail["path"]).path).suffix or ".jpg"
+    thumb_dest = dest.with_suffix(ext)
+    if thumb_dest.exists():
+        return
+    try:
+        r = session.get(thumbnail["path"], timeout=30)
+        r.raise_for_status()
+    except requests.RequestException as e:
+        print(f"  WARNING: could not fetch thumbnail for {dest.name}: {e}", file=sys.stderr)
+        return
+    try:
+        thumb_dest.parent.mkdir(parents=True, exist_ok=True)
+        thumb_dest.write_bytes(r.content)
+    except OSError as e:
+        print(f"  WARNING: could not save thumbnail for {dest.name}: {e}", file=sys.stderr)
+
+
 def load_failed_manifest(out_root: Path) -> list[dict]:
     path = out_root / FAILED_MANIFEST_NAME
     if not path.exists():
@@ -390,13 +415,20 @@ def top_up_video_interval(args, video_start: float) -> None:
         time.sleep(remaining)
 
 
-def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, dest: Path, state: dict) -> None:
+def attempt_video(
+    client: FloatplaneClient, args, video_id: str, fname: str, dest: Path, state: dict, thumbnail: dict | None = None
+) -> None:
     """Size-check (dry run) or download one video. Mutates `state`:
     sizes_disabled (bool), total_bytes/total_unknown (dry-run counters),
     and failed (list of {video_id, fname, dest, reason} dicts, real runs only).
+    `thumbnail` is the post's thumbnail ImageModel dict, if the caller has
+    it (only the normal per-post loop does - the retry-failed and
+    partial-resume passes don't track it, so they just skip this).
     """
     if dest.exists():
         print(f"Skip (already downloaded): {fname}")
+        if not args.dry_run and not args.no_thumbnails:
+            download_thumbnail(client.session, thumbnail, dest)
         return
 
     if args.dry_run and state["sizes_disabled"]:
@@ -460,6 +492,8 @@ def attempt_video(client: FloatplaneClient, args, video_id: str, fname: str, des
     print(f"Downloading: {fname}  [{variant.get('label', '?')}]")
     try:
         download_file(client.session, url, dest, rate_limit=args.limit_rate)
+        if not args.no_thumbnails:
+            download_thumbnail(client.session, thumbnail, dest)
     except (requests.RequestException, OSError) as e:
         print(f"  ERROR downloading {fname}: {e}", file=sys.stderr)
         state["failed"].append(
@@ -526,6 +560,14 @@ def parse_args():
         "with idle time up to this floor; big files that already take longer than this aren't slowed "
         "down further. This is unrelated to --limit-rate, which caps the download's own byte-transfer "
         "speed rather than the gap between videos.",
+    )
+    p.add_argument(
+        "--no-thumbnails",
+        action="store_true",
+        help="Don't save each post's thumbnail image alongside its video. By default, "
+        "<video-basename>.jpg is saved next to each video (backfilling existing files too) - most "
+        "media managers, including Plex, pick up a same-named image next to a video as that "
+        "episode's local artwork automatically, with no online metadata matching required.",
     )
     return p.parse_args()
 
@@ -603,7 +645,7 @@ def main():
                         suffix = f" (part {i + 1})" if len(video_ids) > 1 else ""
                         fname = f"{date_str} - {title}{suffix} [{video_id}].mp4"
                         dest = out_dir / fname
-                        attempt_video(client, args, video_id, fname, dest, state)
+                        attempt_video(client, args, video_id, fname, dest, state, thumbnail=post.get("thumbnail"))
             except FloatplaneError as e:
                 print(f"ERROR: {e}", file=sys.stderr)
                 continue

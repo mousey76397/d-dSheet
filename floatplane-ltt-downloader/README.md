@@ -103,6 +103,12 @@ one.
 - Videos are saved as `<output>/<Creator Name>/<date> - <title> [<id>].mp4`.
 - If a file already exists at that path, it's skipped — safe to re-run
   periodically to pick up new uploads or resume an interrupted run.
+- Each post's thumbnail is saved alongside its video as
+  `<video-basename>.jpg` (pass `--no-thumbnails` to skip this). Most media
+  managers, including Plex, pick up a same-named image next to a video as
+  that episode's local artwork automatically - no online metadata matching
+  needed. This also backfills thumbnails for videos already downloaded
+  before this existed; delete a `.jpg` and re-run to refetch just that one.
 - A partial download resumes via HTTP `Range` requests rather than
   restarting from scratch.
 - Floatplane's CDN quality labels vary by video (e.g. `360p` up to `4K`);
@@ -198,6 +204,39 @@ one.
   that retry - Floatplane down, or failing again for some other reason -
   is listed at the end so you know it needs another pass. Under
   `--dry-run` these are only listed, never touched.
+
+## Using with Plex
+
+**Thumbnails** are handled automatically (see Behaviour above) - Plex picks
+up the `<video-basename>.jpg` saved next to each video as that episode's
+poster with no extra setup, regardless of which agent/naming approach you
+use below.
+
+**Naming/organization** is more of a judgment call, and depends on how much
+you want Plex's online metadata (episode titles, descriptions, air dates
+from a database) versus just browsing your own files. Two reasonable
+options - try one and see how well it actually matches before committing,
+since neither is something this README can promise will work perfectly:
+
+1. **Personal Media / local-only.** Point a Plex library at
+   `<output>/<Creator Name>` and use Plex's "Personal Media Shows" agent
+   (no online matching at all). Plex groups the folder as a show and lists
+   files as episodes using their filenames - the existing
+   `<date> - <title> [<id>].mp4` naming already reads fine this way,
+   and there's no dependency on an external database having accurate (or
+   any) data for this content. This is the safe, guaranteed-to-basically-
+   work option.
+2. **TVDB date-matched.** Some Floatplane/LMG shows do have entries on
+   TheTVDB with per-episode air dates (e.g. searching TheTVDB for
+   "Floatplane Exclusive" turns up a real series page), which Plex's
+   standard TV agent can match against using date-based episode ordering
+   instead of season/episode numbers - if you want real episode
+   descriptions and Plex correctly treats these as a season-per-year show.
+   This needs the filename to contain a `YYYY-MM-DD` date Plex can parse
+   (already true here) and the show set to date-based ordering in Plex's
+   metadata settings for that show; how complete or accurate that data is
+   for a given creator varies, so treat this as worth trying rather than
+   guaranteed to match well.
 
 ## Known limitations
 
