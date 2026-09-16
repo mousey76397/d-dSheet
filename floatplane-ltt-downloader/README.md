@@ -107,7 +107,18 @@ one.
   available quality if that label doesn't exist for a given video, with a
   warning.
 - Requests are retried automatically if Floatplane responds with `429 Too
-  Many Requests`, honouring its `Retry-After` header.
+  Many Requests`. Its `Retry-After` has been observed as high as 300s;
+  rather than block for however long it asks, the actual wait is capped at
+  30s and it just retries sooner (up to 20 attempts) - worst case that
+  costs an extra request or two, which is cheap compared to sitting idle
+  for 5 minutes.
+- Fetching the post listing (`/v3/content/creator`) is normally paced by the
+  time spent downloading each page's videos, but a re-run over a mostly
+  already-downloaded back catalogue has nothing slowing successive pages
+  down - they'd otherwise fire back-to-back fast enough to trip
+  Floatplane's rate limit on this endpoint even while doing nothing but
+  skipping finished files. Page fetches are spaced at least 1.5s apart to
+  stay under that.
 - API calls (post listing, delivery info) also retry automatically through a
   dropped connection or DNS blip (up to 6 attempts, backing off 10s further
   each time) instead of crashing the whole run over a momentary Wi-Fi/ISP

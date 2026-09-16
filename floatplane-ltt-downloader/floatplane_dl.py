@@ -24,8 +24,18 @@ API_BASE = "https://www.floatplane.com/api"
 DEFAULT_UA = "FloatplaneLTTDownloader/1.0 (CFNetwork)"
 
 CHUNK_SIZE = 1024 * 1024
-MAX_RATE_LIMIT_RETRIES = 6
+MAX_RATE_LIMIT_RETRIES = 20
+CONNECTION_ERROR_RETRIES = 6
 CONNECTION_ERROR_BACKOFF = 10.0
+
+# Floatplane's Retry-After on a 429 has been observed as high as 300s. Rather
+# than block for however long it asks, cap what we actually wait and just
+# retry sooner - worst case that costs an extra request or two, which is
+# cheap compared to sitting idle for 5 minutes. MAX_RATE_LIMIT_RETRIES is
+# raised accordingly so a real (mandatory) call - post listing in
+# particular - still gets enough attempts to eventually get through rather
+# than giving up early just because each wait is now shorter.
+RATE_LIMIT_WAIT_CAP = 30
 
 # Floatplane's delivery/info endpoint (the one that returns a video's download
 # URL and size) throttles much more aggressively than its other endpoints when
@@ -35,6 +45,14 @@ CONNECTION_ERROR_BACKOFF = 10.0
 # whatever (large) Retry-After Floatplane sent.
 DELIVERY_INFO_MIN_INTERVAL = 2.0
 DRY_RUN_MAX_RATE_LIMIT_WAIT = 20
+
+# Post listing (/v3/content/creator) has the same problem: fetching each page
+# is normally paced by the time spent downloading that page's videos, but
+# once most of a page is already-downloaded and skipped instantly (e.g. a
+# repeat run over a mostly-finished back catalogue), pages get requested
+# back-to-back with nothing slowing them down, and that alone is enough to
+# trip Floatplane's rate limit on this endpoint too.
+CONTENT_LISTING_MIN_INTERVAL = 1.5
 
 FAILED_MANIFEST_NAME = "failed_downloads.json"
 
@@ -87,28 +105,37 @@ class FloatplaneClient:
         if cookie:
             self.session.cookies.set("sails.sid", cookie, domain=".floatplane.com")
         self._last_delivery_info_call = 0.0
+        self._last_listing_call = 0.0
 
     def _get(self, path: str, max_wait: float | None = None, **params):
         url = f"{API_BASE}{path}"
-        for attempt in range(MAX_RATE_LIMIT_RETRIES):
+        conn_error_attempts = 0
+        rate_limit_attempts = 0
+        while True:
             try:
                 r = self.session.get(url, params=params, timeout=30)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                if attempt == MAX_RATE_LIMIT_RETRIES - 1:
+                conn_error_attempts += 1
+                if conn_error_attempts >= CONNECTION_ERROR_RETRIES:
                     raise FloatplaneError(
                         f"Network error talking to Floatplane on {path} after "
-                        f"{MAX_RATE_LIMIT_RETRIES} attempts: {e}"
+                        f"{CONNECTION_ERROR_RETRIES} attempts: {e}"
                     )
-                wait = CONNECTION_ERROR_BACKOFF * (attempt + 1)
+                wait = CONNECTION_ERROR_BACKOFF * conn_error_attempts
                 print(f"  Network error on {path} ({e.__class__.__name__}), retrying in {wait}s...", file=sys.stderr)
                 time.sleep(wait)
                 continue
             if r.status_code == 429:
+                rate_limit_attempts += 1
+                if rate_limit_attempts >= MAX_RATE_LIMIT_RETRIES:
+                    raise FloatplaneError(f"Repeated rate limiting on {path} after {MAX_RATE_LIMIT_RETRIES} attempts, giving up")
                 wait = int(r.headers.get("Retry-After", 5))
                 if max_wait is not None and wait > max_wait:
                     raise RateLimited(wait)
-                print(f"  Rate limited by Floatplane, waiting {wait}s...", file=sys.stderr)
-                time.sleep(wait)
+                capped_wait = min(wait, RATE_LIMIT_WAIT_CAP)
+                note = f" (capped from {wait}s)" if capped_wait < wait else ""
+                print(f"  Rate limited by Floatplane, waiting {capped_wait}s{note}...", file=sys.stderr)
+                time.sleep(capped_wait)
                 continue
             if not r.ok:
                 hint = ""
@@ -119,7 +146,6 @@ class FloatplaneClient:
                     )
                 raise FloatplaneError(f"Floatplane returned {r.status_code} for {path}.{hint}")
             return r.json()
-        raise FloatplaneError(f"Repeated rate limiting on {path}, giving up")
 
     def login(self, username: str, password: str) -> None:
         r = self.session.post(f"{API_BASE}/v2/auth/login", json={"username": username, "password": password})
@@ -188,7 +214,13 @@ class FloatplaneClient:
                 params["toDate"] = to_date
             if channel_id:
                 params["channel"] = channel_id
-            batch = self._get("/v3/content/creator", **params)
+            elapsed = time.monotonic() - self._last_listing_call
+            if elapsed < CONTENT_LISTING_MIN_INTERVAL:
+                time.sleep(CONTENT_LISTING_MIN_INTERVAL - elapsed)
+            try:
+                batch = self._get("/v3/content/creator", **params)
+            finally:
+                self._last_listing_call = time.monotonic()
             if not batch:
                 return
             yield from batch
