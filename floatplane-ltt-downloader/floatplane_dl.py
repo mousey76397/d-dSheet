@@ -24,18 +24,24 @@ API_BASE = "https://www.floatplane.com/api"
 DEFAULT_UA = "FloatplaneLTTDownloader/1.0 (CFNetwork)"
 
 CHUNK_SIZE = 1024 * 1024
-MAX_RATE_LIMIT_RETRIES = 20
+MAX_RATE_LIMIT_RETRIES = 8
 CONNECTION_ERROR_RETRIES = 6
 CONNECTION_ERROR_BACKOFF = 10.0
 
-# Floatplane's Retry-After on a 429 has been observed as high as 300s. Rather
-# than block for however long it asks, cap what we actually wait and just
-# retry sooner - worst case that costs an extra request or two, which is
-# cheap compared to sitting idle for 5 minutes. MAX_RATE_LIMIT_RETRIES is
-# raised accordingly so a real (mandatory) call - post listing in
-# particular - still gets enough attempts to eventually get through rather
-# than giving up early just because each wait is now shorter.
-RATE_LIMIT_WAIT_CAP = 30
+# Floatplane's Retry-After on a 429 counts down to one fixed reset point in
+# time, not a fresh penalty per request - asking again sooner just gets back
+# a smaller number counting down to that same point, it doesn't move the
+# point up. So the wait is honored as reported (up to a generous safety
+# ceiling, RATE_LIMIT_WAIT_CEILING, purely against a broken/huge header
+# value) rather than capped low and retried sooner - that was tried and
+# made things worse: it burns through the retry budget while the window is
+# still live and, once the countdown nominally reaches 0 but the server is
+# still returning 429 (observed happening for several seconds past 0,
+# likely clock skew at the edge of the window), retrying with no floor on
+# the wait hammers the endpoint at zero delay. RATE_LIMIT_MIN_WAIT puts a
+# floor under that.
+RATE_LIMIT_WAIT_CEILING = 600
+RATE_LIMIT_MIN_WAIT = 5
 
 # Floatplane's delivery/info endpoint (the one that returns a video's download
 # URL and size) throttles much more aggressively than its other endpoints when
@@ -132,10 +138,9 @@ class FloatplaneClient:
                 wait = int(r.headers.get("Retry-After", 5))
                 if max_wait is not None and wait > max_wait:
                     raise RateLimited(wait)
-                capped_wait = min(wait, RATE_LIMIT_WAIT_CAP)
-                note = f" (capped from {wait}s)" if capped_wait < wait else ""
-                print(f"  Rate limited by Floatplane, waiting {capped_wait}s{note}...", file=sys.stderr)
-                time.sleep(capped_wait)
+                wait = max(min(wait, RATE_LIMIT_WAIT_CEILING), RATE_LIMIT_MIN_WAIT)
+                print(f"  Rate limited by Floatplane, waiting {wait}s...", file=sys.stderr)
+                time.sleep(wait)
                 continue
             if not r.ok:
                 hint = ""
