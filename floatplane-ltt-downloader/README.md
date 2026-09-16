@@ -118,13 +118,15 @@ one.
   consecutive 429 on the same request (5s, 10s, 15s, ... up to 60s) to
   actually ride that out, backed by a generous 30-attempt budget so it
   doesn't give up while still in that tail.
-- Fetching the post listing (`/v3/content/creator`) is normally paced by the
-  time spent downloading each page's videos, but a re-run over a mostly
-  already-downloaded back catalogue has nothing slowing successive pages
-  down - they'd otherwise fire back-to-back fast enough to trip
-  Floatplane's rate limit on this endpoint even while doing nothing but
-  skipping finished files. Page fetches are spaced at least 1.5s apart to
-  stay under that.
+- Every API call (post listing, delivery info, creator lookup) is spaced
+  out from the previous one by a random delay between 2 and 10 seconds,
+  rather than a fixed interval - both to stay under whatever Floatplane's
+  real (undocumented) rate limit actually is, and because a perfectly
+  regular period between requests is itself a giveaway that this is a
+  script, not a person clicking around. This matters most on a re-run
+  over a mostly already-downloaded back catalogue: skipping a finished
+  file is instant, so without this pacing, page-listing requests would
+  otherwise fire back-to-back as fast as the network allows.
 - API calls (post listing, delivery info) also retry automatically through a
   dropped connection or DNS blip (up to 6 attempts, backing off 10s further
   each time) instead of crashing the whole run over a momentary Wi-Fi/ISP
@@ -149,12 +151,13 @@ one.
   of API calls as a real run — it just skips the actual video download.
 - Floatplane throttles that per-video delivery-info lookup much harder than
   its other endpoints when it's hit back-to-back with no download in
-  between, which a `--dry-run` size scan does by nature. To cope: calls are
-  paced a couple of seconds apart, and if Floatplane still asks for a wait
-  longer than 20s, size lookups are dropped for the rest of that dry run
-  (remaining files just list as "size unknown" instead of the whole run
-  stalling for however long Floatplane asked for). This doesn't apply to a
-  real download run, where the download itself already spaces requests out.
+  between, which a `--dry-run` size scan does by nature even with the
+  random pacing above. So specifically for dry-run size lookups: if
+  Floatplane asks for a wait longer than 20s, size lookups are dropped for
+  the rest of that dry run (remaining files just list as "size unknown"
+  instead of the whole run stalling for however long Floatplane asked
+  for). This doesn't apply to a real download run, where the download
+  itself already spaces requests out.
 - When a real run finishes, anything that failed or was skipped due to an
   error (couldn't fetch delivery info, no downloadable variant, a download
   that errored out) is listed by filename and reason, and recorded in

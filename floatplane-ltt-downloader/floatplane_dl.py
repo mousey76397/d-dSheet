@@ -8,6 +8,7 @@ See README.md for authentication setup.
 import argparse
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -49,22 +50,19 @@ RATE_LIMIT_WAIT_CEILING = 600
 RATE_LIMIT_MIN_WAIT = 5
 RATE_LIMIT_ESCALATION_CEILING = 60
 
-# Floatplane's delivery/info endpoint (the one that returns a video's download
-# URL and size) throttles much more aggressively than its other endpoints when
-# hit back-to-back with no download in between - as dry-run size lookups do.
-# Space calls out to stay under that, and cap how long dry-run is willing to
-# block on a single 429 before giving up on sizes rather than stalling for
-# whatever (large) Retry-After Floatplane sent.
-DELIVERY_INFO_MIN_INTERVAL = 2.0
-DRY_RUN_MAX_RATE_LIMIT_WAIT = 20
+# Every API call is spaced out by a random delay in this range rather than a
+# fixed interval, both to stay under whatever Floatplane's real (undocumented,
+# unknown) rate limit actually is, and because a fixed period between requests
+# is itself a very machine-like pattern - a video-by-video scripted crawl
+# looks nothing like a human clicking around regardless of the exact delay,
+# but randomizing it is a cheap, low-risk thing to do on top of the pacing we
+# already need. This applies between any two calls, not just delivery/info -
+# it used to be two separate fixed intervals (one for delivery/info, one for
+# post listing) tuned individually; a single random-jittered pace covers both
+# and any other call through the same code path.
+REQUEST_JITTER_RANGE = (2.0, 10.0)
 
-# Post listing (/v3/content/creator) has the same problem: fetching each page
-# is normally paced by the time spent downloading that page's videos, but
-# once most of a page is already-downloaded and skipped instantly (e.g. a
-# repeat run over a mostly-finished back catalogue), pages get requested
-# back-to-back with nothing slowing them down, and that alone is enough to
-# trip Floatplane's rate limit on this endpoint too.
-CONTENT_LISTING_MIN_INTERVAL = 1.5
+DRY_RUN_MAX_RATE_LIMIT_WAIT = 20
 
 FAILED_MANIFEST_NAME = "failed_downloads.json"
 
@@ -116,16 +114,21 @@ class FloatplaneClient:
         self.session.headers.update({"User-Agent": user_agent, "Accept": "application/json"})
         if cookie:
             self.session.cookies.set("sails.sid", cookie, domain=".floatplane.com")
-        self._last_delivery_info_call = 0.0
-        self._last_listing_call = 0.0
+        self._last_request_time = 0.0
 
     def _get(self, path: str, max_wait: float | None = None, **params):
         url = f"{API_BASE}{path}"
+        elapsed = time.monotonic() - self._last_request_time
+        jitter = random.uniform(*REQUEST_JITTER_RANGE)
+        if elapsed < jitter:
+            time.sleep(jitter - elapsed)
+
         conn_error_attempts = 0
         rate_limit_attempts = 0
         while True:
             try:
                 r = self.session.get(url, params=params, timeout=30)
+                self._last_request_time = time.monotonic()
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
                 conn_error_attempts += 1
                 if conn_error_attempts >= CONNECTION_ERROR_RETRIES:
@@ -226,13 +229,7 @@ class FloatplaneClient:
                 params["toDate"] = to_date
             if channel_id:
                 params["channel"] = channel_id
-            elapsed = time.monotonic() - self._last_listing_call
-            if elapsed < CONTENT_LISTING_MIN_INTERVAL:
-                time.sleep(CONTENT_LISTING_MIN_INTERVAL - elapsed)
-            try:
-                batch = self._get("/v3/content/creator", **params)
-            finally:
-                self._last_listing_call = time.monotonic()
+            batch = self._get("/v3/content/creator", **params)
             if not batch:
                 return
             yield from batch
@@ -241,13 +238,7 @@ class FloatplaneClient:
             fetch_after += page_size
 
     def delivery_info(self, entity_id: str, max_wait: float | None = None) -> dict:
-        elapsed = time.monotonic() - self._last_delivery_info_call
-        if elapsed < DELIVERY_INFO_MIN_INTERVAL:
-            time.sleep(DELIVERY_INFO_MIN_INTERVAL - elapsed)
-        try:
-            return self._get("/v3/delivery/info", max_wait=max_wait, scenario="download", entityId=entity_id)
-        finally:
-            self._last_delivery_info_call = time.monotonic()
+        return self._get("/v3/delivery/info", max_wait=max_wait, scenario="download", entityId=entity_id)
 
 
 def pick_variant(delivery: dict, preferred_label: str | None):
