@@ -24,24 +24,30 @@ API_BASE = "https://www.floatplane.com/api"
 DEFAULT_UA = "FloatplaneLTTDownloader/1.0 (CFNetwork)"
 
 CHUNK_SIZE = 1024 * 1024
-MAX_RATE_LIMIT_RETRIES = 8
+MAX_RATE_LIMIT_RETRIES = 30
 CONNECTION_ERROR_RETRIES = 6
 CONNECTION_ERROR_BACKOFF = 10.0
 
 # Floatplane's Retry-After on a 429 counts down to one fixed reset point in
-# time, not a fresh penalty per request - asking again sooner just gets back
-# a smaller number counting down to that same point, it doesn't move the
-# point up. So the wait is honored as reported (up to a generous safety
-# ceiling, RATE_LIMIT_WAIT_CEILING, purely against a broken/huge header
-# value) rather than capped low and retried sooner - that was tried and
-# made things worse: it burns through the retry budget while the window is
-# still live and, once the countdown nominally reaches 0 but the server is
-# still returning 429 (observed happening for several seconds past 0,
-# likely clock skew at the edge of the window), retrying with no floor on
-# the wait hammers the endpoint at zero delay. RATE_LIMIT_MIN_WAIT puts a
-# floor under that.
+# time, not a fresh penalty per request, so it's honored as reported (up to
+# a generous safety ceiling, RATE_LIMIT_WAIT_CEILING, purely against a
+# broken/huge header value) rather than capped low and retried sooner - that
+# was tried and made things worse, burning through the retry budget while
+# the window was still live.
+#
+# But honoring it wasn't sufficient either: even before that, the pattern
+# reported was "wait the first (large) value, then several more 429s with
+# small/near-zero Retry-After before it actually clears" - a flaky tail
+# right at the edge of the window, likely clock skew between us and
+# whichever edge node answers next. A flat small floor there just hammers
+# through the retry budget just as fast. So the floor escalates with each
+# consecutive rate-limit hit on this call (RATE_LIMIT_MIN_WAIT *
+# rate_limit_attempts, capped at RATE_LIMIT_ESCALATION_CEILING) to actually
+# ride out that tail, and the retry budget is generous enough for that
+# escalation to matter.
 RATE_LIMIT_WAIT_CEILING = 600
 RATE_LIMIT_MIN_WAIT = 5
+RATE_LIMIT_ESCALATION_CEILING = 60
 
 # Floatplane's delivery/info endpoint (the one that returns a video's download
 # URL and size) throttles much more aggressively than its other endpoints when
@@ -135,11 +141,12 @@ class FloatplaneClient:
                 rate_limit_attempts += 1
                 if rate_limit_attempts >= MAX_RATE_LIMIT_RETRIES:
                     raise FloatplaneError(f"Repeated rate limiting on {path} after {MAX_RATE_LIMIT_RETRIES} attempts, giving up")
-                wait = int(r.headers.get("Retry-After", 5))
-                if max_wait is not None and wait > max_wait:
-                    raise RateLimited(wait)
-                wait = max(min(wait, RATE_LIMIT_WAIT_CEILING), RATE_LIMIT_MIN_WAIT)
-                print(f"  Rate limited by Floatplane, waiting {wait}s...", file=sys.stderr)
+                reported_wait = int(r.headers.get("Retry-After", 5))
+                if max_wait is not None and reported_wait > max_wait:
+                    raise RateLimited(reported_wait)
+                escalating_floor = min(RATE_LIMIT_MIN_WAIT * rate_limit_attempts, RATE_LIMIT_ESCALATION_CEILING)
+                wait = max(min(reported_wait, RATE_LIMIT_WAIT_CEILING), escalating_floor)
+                print(f"  Rate limited by Floatplane, waiting {wait}s (attempt {rate_limit_attempts})...", file=sys.stderr)
                 time.sleep(wait)
                 continue
             if not r.ok:
