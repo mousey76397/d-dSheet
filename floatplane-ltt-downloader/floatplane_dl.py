@@ -196,8 +196,8 @@ class FloatplaneClient:
             raise FloatplaneError(f"Creator '{urlname}' not found.")
         return data[0]
 
-    def resolve_channel(self, creator: dict, channel_urlname: str) -> str:
-        """Resolve a sub-channel URL name (e.g. 'fpexclusive') to its channel id.
+    def resolve_channel(self, creator: dict, channel_urlname: str) -> dict:
+        """Resolve a sub-channel URL name (e.g. 'fpexclusive') to its channel dict.
 
         Sub-channels (Main, Behind the Scenes, FP Exclusive, ...) are not
         separate creators - they're listed under the creator's own 'channels'.
@@ -205,7 +205,7 @@ class FloatplaneClient:
         channels = creator.get("channels") or []
         for channel in channels:
             if channel.get("urlname", "").lower() == channel_urlname.lower():
-                return channel["id"]
+                return channel
         available = ", ".join(c.get("urlname", "?") for c in channels) or "none"
         raise FloatplaneError(
             f"Channel '{channel_urlname}' not found under creator '{creator.get('urlname')}'. "
@@ -610,18 +610,32 @@ def main():
         for creator_name in [c.strip() for c in args.creator.split(",") if c.strip()]:
             try:
                 creator = client.get_creator(creator_name)
-                channel_id = client.resolve_channel(creator, args.channel) if args.channel else None
+                channel = client.resolve_channel(creator, args.channel) if args.channel else None
+                channel_id = channel["id"] if channel else None
             except FloatplaneError as e:
                 print(f"ERROR: {e}", file=sys.stderr)
                 continue
 
             label = f"{creator['title']} ({creator_name})"
-            if args.channel:
-                label += f" / {args.channel}"
+            if channel:
+                label += f" / {channel.get('title', args.channel)}"
             print(f"\n== {label} ==")
             out_dir = out_root / sanitize(creator["title"])
-            if args.channel:
-                out_dir = out_dir / sanitize(args.channel)
+            if channel:
+                new_channel_dir = sanitize(channel.get("title") or args.channel)
+                old_channel_dir = sanitize(args.channel)
+                new_out_dir = out_dir / new_channel_dir
+                old_out_dir = out_dir / old_channel_dir
+                if old_channel_dir != new_channel_dir and old_out_dir.exists() and not new_out_dir.exists():
+                    old_out_dir.rename(new_out_dir)
+                    print(
+                        f"Renamed existing '{old_out_dir}' to '{new_out_dir}' to match Floatplane's "
+                        "real channel title, instead of the raw --channel URL name used before - "
+                        "this keeps every already-downloaded file recognized as done rather than "
+                        "re-downloading the whole channel."
+                    )
+                out_dir = new_out_dir
+            print(f"Output folder: {out_dir}")
             processed = 0
             state["total_bytes"] = 0
             state["total_unknown"] = 0
